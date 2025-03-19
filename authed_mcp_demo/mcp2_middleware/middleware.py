@@ -1,15 +1,21 @@
 import asyncio
 import os
 import json
-from fastapi import FastAPI, Request, Response, HTTPException
+import logging
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-import httpx
-from typing import Dict, List, Any, Optional
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 
 from authed import Authed
 from authed_mcp import AuthedMCPClient
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
