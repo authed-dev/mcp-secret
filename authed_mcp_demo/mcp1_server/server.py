@@ -1,11 +1,13 @@
 import asyncio
+import os
 import logging
 from dotenv import load_dotenv
 
 # Import from the correct modules
 from authed import Authed
+from authed.cli.commands.keys import generate_keypair
 from authed_mcp.server import create_server, run_server
-from .op_client import OnePasswordClient
+from op_client import OnePasswordClient  # Simple import from the same directory
 
 # Configure logging
 logging.basicConfig(
@@ -20,11 +22,15 @@ load_dotenv()
 # Initialize 1Password client
 op_client = OnePasswordClient()
 
-async def main():
+def main():
     """Run the 1Password MCP server with Authed authentication."""
     try:
-        # Initialize 1Password client
-        await op_client.connect()
+        # Initialize 1Password client using a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Connect to 1Password
+        loop.run_until_complete(op_client.connect())
         logger.info("Connected to 1Password")
         
         # Create the server with values from environment variables
@@ -32,7 +38,7 @@ async def main():
         logger.info("Server created successfully")
         
         # Register 1Password resources
-        @server.resource("1password/vaults")
+        @server.resource("op://vaults")
         async def list_vaults_resource():
             """List all available 1Password vaults"""
             try:
@@ -42,7 +48,7 @@ async def main():
                 logger.error(f"Error listing vaults: {str(e)}")
                 return {"error": str(e)}, "application/json", 500
 
-        @server.resource("1password/vaults/{vault_id}/items")
+        @server.resource("op://vaults/{vault_id}/items")
         async def list_items_resource(vault_id: str):
             """List all items in a 1Password vault"""
             try:
@@ -52,10 +58,12 @@ async def main():
                 logger.error(f"Error listing items: {str(e)}")
                 return {"error": str(e)}, "application/json", 500
 
-        @server.resource("1password/vaults/{vault_id}/items/{item_id}")
-        async def get_secret_resource(vault_id: str, item_id: str, field: str = None):
+        @server.resource("op://vaults/{vault_id}/items/{item_id}")
+        async def get_secret_resource(vault_id: str, item_id: str):
             """Get a secret from 1Password"""
             try:
+                # Get field from query param if present
+                field = "credentials"
                 secret = await op_client.get_secret(vault_id, item_id, field)
                 return {"secret": secret}, "application/json"
             except Exception as e:
@@ -109,7 +117,6 @@ async def main():
         logger.info("Starting 1Password MCP server with Authed authentication...")
         run_server(server, host="0.0.0.0", port=8000)
         
-        # Note: This line will only be reached when the server is stopped
         return server
         
     except Exception as e:
@@ -118,4 +125,4 @@ async def main():
         return None
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
