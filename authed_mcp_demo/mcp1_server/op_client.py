@@ -39,38 +39,57 @@ class OnePasswordClient:
         if not self.client:
             await self.connect()
         
-        # Create the secret reference
+        # If field_name is provided, create a secret reference
         if field_name:
+            # Format: op://<vault>/<item>/[section/]<field>
             secret_ref = f"op://{vault_id}/{item_id}/{field_name}"
-        else:
-            secret_ref = f"op://{vault_id}/{item_id}"
+            try:
+                # Validate and resolve the secret reference
+                try:
+                    await self.client.secrets.validate_secret_reference(secret_ref)
+                except Exception as e:
+                    print(f"Warning: Invalid secret reference format: {e}")
+                
+                # Resolve the secret
+                return await self.client.secrets.resolve(secret_ref)
+            except Exception as e:
+                print(f"Error resolving secret reference '{secret_ref}': {e}")
+                # Continue to fallback method
         
-        # Resolve the secret
+        # Fallback: get the item directly
         try:
-            return await self.client.secrets.resolve(secret_ref)
-        except Exception as e:
-            # If we couldn't resolve it with the simple format, try to get the item and field directly
+            # Get the item - note the positional parameters
+            item = await self.client.items.get(item_id, vault_id)
+            
             if field_name:
-                # This is a fallback in case the reference doesn't work
-                item = await self.client.items.get(item_id, vault=vault_id)
+                # Look for the specific field
                 for field in item.fields:
                     if field.label.lower() == field_name.lower() or field.id.lower() == field_name.lower():
                         return field.value
                 raise ValueError(f"Field '{field_name}' not found in item '{item_id}'")
-            raise e
+            return item
+        except Exception as e:
+            raise ValueError(f"Error getting item: {e}")
     
     async def list_vaults(self) -> List[Dict[str, str]]:
         """List all available vaults."""
         if not self.client:
             await self.connect()
         
-        vaults = await self.client.vaults.list()
-        return [{"id": vault.id, "name": vault.name} for vault in vaults]
+        result = []
+        vaults = await self.client.vaults.list_all()
+        async for vault in vaults:
+            result.append({"id": vault.id, "name": vault.title})
+        return result
     
     async def list_items(self, vault_id: str) -> List[Dict[str, str]]:
         """List all items in a vault."""
         if not self.client:
             await self.connect()
         
-        items = await self.client.items.list(vault=vault_id)
-        return [{"id": item.id, "title": item.title} for item in items]
+        result = []
+        # Pass the vault_id as a positional parameter
+        items = await self.client.items.list_all(vault_id)
+        async for item in items:
+            result.append({"id": item.id, "title": item.title})
+        return result
