@@ -1,0 +1,10 @@
+authed
+authed-mcp
+fastapi
+uvicorn
+httpx
+asyncio
+pydantic
+python-dotenv
+# The official 1Password SDK for Python
+onepassword-sdk
