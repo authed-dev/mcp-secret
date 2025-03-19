@@ -115,7 +115,7 @@ def main():
         
         # Run the server
         logger.info("Starting 1Password MCP server with Authed authentication...")
-        run_server(server, host="0.0.0.0", port=8000)
+        run_server(server, host="0.0.0.0", port=8080)
         
         return server
         
