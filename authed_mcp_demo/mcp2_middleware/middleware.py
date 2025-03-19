@@ -1,194 +1,252 @@
 import asyncio
 import os
-import json
 import logging
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+import sys
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import AsyncIterator, Dict, Any, List, Optional
+
 from dotenv import load_dotenv
 
+# Import the actual MCP SDK components
+from mcp.server.fastmcp import Context, FastMCP
+
+# Import Authed components
 from authed import Authed
 from authed_mcp import AuthedMCPClient
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("mcp2_middleware")
 
 # Load environment variables
 load_dotenv()
 
-# Initialize FastAPI app
-app = FastAPI(title="MCP2 Middleware")
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Configuration
-MCP1_SERVER_URL = os.getenv("MCP1_SERVER_URL", "http://localhost:8000")
+# Configuration for 1Password MCP server
+MCP1_SERVER_URL = os.getenv("MCP1_SERVER_URL", "http://localhost:8080")
 MCP1_SERVER_AGENT_ID = os.getenv("MCP1_SERVER_AGENT_ID")
 
-# Initialize Authed client for MCP1 server access
-authed = Authed.from_env()
-mcp1_client = None
+# Configuration for Authed
+AUTHED_REGISTRY_URL = os.getenv("AUTHED_REGISTRY_URL", "https://api.getauthed.dev")
+AUTHED_AGENT_ID = os.getenv("AUTHED_AGENT_ID")
+AUTHED_AGENT_SECRET = os.getenv("AUTHED_AGENT_SECRET")
+AUTHED_PRIVATE_KEY = os.getenv("AUTHED_PRIVATE_KEY")
 
-async def get_mcp1_client():
-    """Get or initialize the AuthedMCPClient for the MCP1 server"""
-    global mcp1_client
-    if mcp1_client is None:
-        mcp1_client = AuthedMCPClient(authed=authed)
-    return mcp1_client
+# Global client references
+authed_client = None
+mcp_client = None
+mcp_session = None  # Store the MCP session globally
 
-# MCP protocol endpoints for Cursor
-@app.get("/mcp/resources")
-async def list_resources(request: Request):
-    """MCP endpoint to list available resources by proxying to MCP1 server"""
-    client = await get_mcp1_client()
-    try:
-        # List resources from MCP1 server
-        resources = await client.list_resources(
-            server_url=MCP1_SERVER_URL,
-            server_agent_id=MCP1_SERVER_AGENT_ID
-        )
-        
-        # Return resources to Cursor
-        return resources
-    except Exception as e:
-        print(f"Error listing resources: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+# Type-safe context for the application
+@dataclass
+class AppContext:
+    authed_client: Authed
+    mcp_client: AuthedMCPClient
 
-@app.get("/mcp/resources/{resource_path:path}")
-async def get_resource(request: Request, resource_path: str):
-    """MCP endpoint to get a resource from the MCP1 server"""
-    client = await get_mcp1_client()
-    try:
-        # Extract query parameters
-        params = dict(request.query_params)
-        
-        # Call the resource on MCP1 server
-        result = await client.call_resource(
-            server_url=MCP1_SERVER_URL,
-            server_agent_id=MCP1_SERVER_AGENT_ID,
-            resource_path=f"/{resource_path}",
-            method="GET",
-            params=params
-        )
-        
-        # Return the result
-        return result
-    except Exception as e:
-        print(f"Error getting resource: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/mcp/tools")
-async def list_tools(request: Request):
-    """MCP endpoint to list available tools by proxying to MCP1 server"""
-    client = await get_mcp1_client()
-    try:
-        # List tools from MCP1 server
-        tools = await client.list_tools(
-            server_url=MCP1_SERVER_URL,
-            server_agent_id=MCP1_SERVER_AGENT_ID
-        )
-        
-        # Return tools to Cursor
-        return tools
-    except Exception as e:
-        print(f"Error listing tools: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/mcp/tools/{tool_id}")
-async def call_tool(request: Request, tool_id: str):
-    """MCP endpoint to call a tool on the MCP1 server"""
-    client = await get_mcp1_client()
-    try:
-        # Get the request body
-        data = await request.json()
-        
-        # Call the tool on MCP1 server
-        result = await client.call_tool(
-            server_url=MCP1_SERVER_URL,
-            server_agent_id=MCP1_SERVER_AGENT_ID,
-            tool_id=tool_id,
-            params=data
-        )
-        
-        # Return the result
-        return result
-    except Exception as e:
-        print(f"Error calling tool: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Additional endpoints for usability
-
-@app.get("/")
-async def root():
-    """Root endpoint for health check"""
-    return {
-        "status": "ok", 
-        "service": "MCP2 Middleware", 
-        "connected_to": f"{MCP1_SERVER_URL} (agent: {MCP1_SERVER_AGENT_ID})"
-    }
-
-# SSE stream for Cursor using the MCP protocol
-@app.get("/mcp/sse")
-async def sse(request: Request):
-    """Server-Sent Events endpoint for MCP streaming"""
+# Lifespan context manager
+@asynccontextmanager
+async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+    """Manage application lifecycle with initialization and cleanup"""
+    global authed_client, mcp_client, mcp_session
     
-    async def event_stream():
-        try:
-            # Send initial connection event
-            yield f"data: {json.dumps({'type': 'connection', 'status': 'connected'})}\n\n"
-            
-            # Keep the connection alive
-            while True:
-                await asyncio.sleep(30)
-                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
-                
-        except asyncio.CancelledError:
-            # Connection closed
-            yield f"data: {json.dumps({'type': 'connection', 'status': 'disconnected'})}\n\n"
+    logger.info("Initializing 1Password MCP Bridge...")
     
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+    # Initialize Authed client
+    # logger.info("Initializing Authed client...")
+    # authed_client = Authed.from_env()
+    
+    # Initialize MCP client
+    # logger.info("Initializing AuthedMCPClient...")
+    # mcp_client = AuthedMCPClient(
+    #     registry_url=AUTHED_REGISTRY_URL,
+    #     agent_id=AUTHED_AGENT_ID,
+    #     agent_secret=AUTHED_AGENT_SECRET,
+    #     private_key=AUTHED_PRIVATE_KEY
+    # )
+    
+    # Create and yield the application context
+    context = AppContext(
+        authed_client=None,
+        mcp_client=None
     )
+    
+    try:
+        # Test connection to 1Password MCP server and establish session
+        # try:
+        #     logger.info(f"Testing connection to 1Password MCP server at {MCP1_SERVER_URL}...")
+        #     # Establish a single SSE connection and session
+        #     mcp_session = await mcp_client.connect_and_execute(
+        #         server_url=MCP1_SERVER_URL,
+        #         server_agent_id=MCP1_SERVER_AGENT_ID,
+        #         operation=lambda session: session
+        #     )
+        #     logger.info(f"Successfully connected to 1Password MCP server")
+            
+        #     # Test the connection by listing resources
+        #     resources = await mcp_session.list_resources()
+        #     logger.info(f"Available resources: {resources}")
+        # except Exception as e:
+        #     logger.error(f"Error connecting to 1Password MCP server: {str(e)}")
+        #     logger.error("Please check your configuration and make sure the MCP1 server is running.")
+        #     # We continue despite the error to allow the server to start
+        #     # The connection might be established later
+        
+        yield context
+    finally:
+        # Cleanup resources on shutdown
+        logger.info("Shutting down 1Password MCP Bridge...")
+        # if mcp_session:
+        #     await mcp_session.close()
+
+# Create a FastMCP server with proper name and metadata
+mcp = FastMCP(
+    "1Password MCP Bridge",
+    description="Bridge between standard MCP and Authed-authenticated 1Password MCP server",
+    host="0.0.0.0",  # Bind to all interfaces
+    port=8000        # Explicit port for Cursor
+)
+
+# Add a test tool to verify server functionality
+@mcp.tool()
+async def test_tool() -> Dict[str, str]:
+    """Test tool to verify server functionality"""
+    return {"status": "Server is working!"}
+
+# Define resources that mirror the 1Password MCP server
+@mcp.resource("op://vaults")
+async def list_vaults() -> Dict[str, List[Dict[str, Any]]]:
+    """List all available 1Password vaults"""
+    logger.info("Processing request to list vaults")
+    try:
+        # Using global session reference
+        global mcp_session
+        
+        # Use the existing session
+        response = await mcp_session.list_resources()
+        
+        logger.info(f"Successfully retrieved vaults from 1Password MCP server")
+        return response
+    except Exception as e:
+        logger.error(f"Error listing vaults: {str(e)}")
+        raise Exception(f"Error listing vaults: {str(e)}")
+
+@mcp.resource("op://vaults/{vault_id}/items")
+async def list_items(vault_id: str) -> Dict[str, Any]:
+    """List all items in a 1Password vault"""
+    logger.info(f"Processing request to list items in vault {vault_id}")
+    try:
+        # Using global session reference
+        global mcp_session
+        
+        # Use the existing session
+        response = await mcp_session.read_resource(f"op://vaults/{vault_id}/items")
+        
+        logger.info(f"Successfully retrieved items from vault {vault_id}")
+        return response
+    except Exception as e:
+        logger.error(f"Error listing items in vault {vault_id}: {str(e)}")
+        raise Exception(f"Error listing items: {str(e)}")
+
+@mcp.resource("op://vaults/{vault_id}/items/{item_id}")
+async def get_secret(vault_id: str, item_id: str) -> Dict[str, Any]:
+    """Get a secret from 1Password"""
+    logger.info(f"Processing request to get secret {item_id} from vault {vault_id}")
+    
+    try:
+        # Using global session reference
+        global mcp_session
+        
+        # Use the existing session
+        response = await mcp_session.read_resource(f"op://vaults/{vault_id}/items/{item_id}")
+        
+        logger.info(f"Successfully retrieved secret {item_id} from vault {vault_id}")
+        return response
+    except Exception as e:
+        logger.error(f"Error getting secret: {str(e)}")
+        raise Exception(f"Error getting secret: {str(e)}")
+
+# Define tools that mirror the 1Password MCP server's tools
+@mcp.tool()
+async def onepassword_get_secret(ctx: Context, vault_id: str, item_id: str, field_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Retrieve a secret from 1Password
+    
+    Args:
+        vault_id: ID or name of the vault containing the secret
+        item_id: ID or title of the item containing the secret
+        field_name: Optional name of the field to retrieve
+    """
+    logger.info(f"Processing tool call to get secret {item_id} from vault {vault_id}")
+    try:
+        # Using global session reference
+        global mcp_session
+        
+        # Use the existing session
+        response = await mcp_session.call_tool("onepassword_get_secret", {
+            "vault_id": vault_id,
+            "item_id": item_id,
+            "field_name": field_name
+        })
+        
+        logger.info(f"Successfully retrieved secret using tool")
+        return response
+    except Exception as e:
+        logger.error(f"Error with onepassword_get_secret tool: {str(e)}")
+        return {"error": str(e)}
+
+@mcp.tool()
+async def onepassword_list_vaults(ctx: Context) -> Dict[str, Any]:
+    """List all available 1Password vaults"""
+    logger.info("Processing tool call to list vaults")
+    try:
+        # Using global session reference
+        global mcp_session
+        
+        # Use the existing session
+        response = await mcp_session.call_tool("onepassword_list_vaults", {})
+        
+        logger.info("Successfully retrieved vaults using tool")
+        return response
+    except Exception as e:
+        logger.error(f"Error with onepassword_list_vaults tool: {str(e)}")
+        return {"error": str(e)}
+
+@mcp.tool()
+async def onepassword_list_items(ctx: Context, vault_id: str) -> Dict[str, Any]:
+    """
+    List all items in a 1Password vault
+    
+    Args:
+        vault_id: ID or name of the vault to list items from
+    """
+    logger.info(f"Processing tool call to list items in vault {vault_id}")
+    try:
+        # Using global session reference
+        global mcp_session
+        
+        # Use the existing session
+        response = await mcp_session.call_tool("onepassword_list_items", {
+            "vault_id": vault_id
+        })
+        
+        logger.info(f"Successfully retrieved items using tool")
+        return response
+    except Exception as e:
+        logger.error(f"Error with onepassword_list_items tool: {str(e)}")
+        return {"error": str(e)}
 
 # Main function
-async def main():
-    """Main function"""
-    import uvicorn
-    
-    # Initialize the MCP1 client
-    client = await get_mcp1_client()
-    
-    # Check connection to MCP1 server
-    try:
-        resources = await client.list_resources(
-            server_url=MCP1_SERVER_URL,
-            server_agent_id=MCP1_SERVER_AGENT_ID
-        )
-        print(f"Connected to MCP1 server at {MCP1_SERVER_URL}")
-        print(f"Available resources: {resources}")
-    except Exception as e:
-        print(f"Error connecting to MCP1 server: {str(e)}")
-        print("Please check your configuration and make sure the MCP1 server is running.")
-    
-    # Start the server
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+def main():
+    """Run the 1Password MCP Bridge server"""
+    # Start the MCP server
+    logger.info("Starting 1Password MCP Bridge server...")
+    mcp.run(transport="sse")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
