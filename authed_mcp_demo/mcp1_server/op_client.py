@@ -24,52 +24,87 @@ class OnePasswordClient:
         )
         return self.client
     
-    async def get_secret(self, vault_id: str, item_id: str, field_name: Optional[str] = None) -> Any:
+    async def get_secret(self, vault_id_or_name: str, item_id_or_name: str, field_name: str = "credential") -> Any:
         """
         Retrieve a secret from 1Password.
         
         Args:
-            vault_id (str): The ID or name of the vault containing the secret
-            item_id (str): The ID or title of the item containing the secret
-            field_name (str, optional): The specific field to retrieve
+            vault_id_or_name (str): The ID or name of the vault
+            item_id_or_name (str): The ID or title of the item
+            field_name (str, optional): The field to retrieve, defaults to "credential"
             
         Returns:
-            The secret value or the entire item if field_name is None
+            The secret value if field_name is specified, otherwise information about the item
         """
         if not self.client:
             await self.connect()
         
-        # If field_name is provided, create a secret reference
-        if field_name:
-            # Format: op://<vault>/<item>/[section/]<field>
-            secret_ref = f"op://{vault_id}/{item_id}/{field_name}"
-            try:
-                # Validate and resolve the secret reference
-                try:
-                    await self.client.secrets.validate_secret_reference(secret_ref)
-                except Exception as e:
-                    print(f"Warning: Invalid secret reference format: {e}")
-                
-                # Resolve the secret
-                return await self.client.secrets.resolve(secret_ref)
-            except Exception as e:
-                print(f"Error resolving secret reference '{secret_ref}': {e}")
-                # Continue to fallback method
+        # First, find the vault
+        vault_info = await self._find_vault(vault_id_or_name)
+        if not vault_info:
+            raise ValueError(f"Vault '{vault_id_or_name}' not found")
         
-        # Fallback: get the item directly
+        vault_id = vault_info["id"]
+        vault_title = vault_info["name"]
+        
+        # Then, find the item
+        item_info = await self._find_item(vault_id, item_id_or_name)
+        if not item_info:
+            raise ValueError(f"Item '{item_id_or_name}' not found in vault '{vault_title}'")
+        
+        item_id = item_info["id"]
+        item_title = item_info["title"]
+        
+        # Use the secret reference directly
         try:
-            # Get the item - note the positional parameters
-            item = await self.client.items.get(item_id, vault_id)
-            
-            if field_name:
-                # Look for the specific field
-                for field in item.fields:
-                    if field.label.lower() == field_name.lower() or field.id.lower() == field_name.lower():
-                        return field.value
-                raise ValueError(f"Field '{field_name}' not found in item '{item_id}'")
-            return item
+            # Format: op://<vault>/<item>/<field>
+            # Use vault title and item title in the reference
+            secret_ref = f"op://{vault_title}/{item_title}/{field_name}"
+            return await self.client.secrets.resolve(secret_ref)
         except Exception as e:
-            raise ValueError(f"Error getting item: {e}")
+            raise ValueError(f"Error retrieving secret: {e}")
+    
+    async def _find_vault(self, vault_id_or_name: str) -> Optional[Dict[str, str]]:
+        """Find a vault by ID or name."""
+        vaults = await self.list_vaults()
+        
+        # First try exact ID match
+        for vault in vaults:
+            if vault["id"] == vault_id_or_name:
+                return vault
+        
+        # Then try exact name match
+        for vault in vaults:
+            if vault["name"] == vault_id_or_name:
+                return vault
+                
+        # Finally try case-insensitive name match
+        for vault in vaults:
+            if vault["name"].lower() == vault_id_or_name.lower():
+                return vault
+                
+        return None
+    
+    async def _find_item(self, vault_id: str, item_id_or_name: str) -> Optional[Dict[str, str]]:
+        """Find an item by ID or name in a specific vault."""
+        items = await self.list_items(vault_id)
+        
+        # First try exact ID match
+        for item in items:
+            if item["id"] == item_id_or_name:
+                return item
+        
+        # Then try exact title match
+        for item in items:
+            if item["title"] == item_id_or_name:
+                return item
+                
+        # Finally try case-insensitive title match
+        for item in items:
+            if item["title"].lower() == item_id_or_name.lower():
+                return item
+                
+        return None
     
     async def list_vaults(self) -> List[Dict[str, str]]:
         """List all available vaults."""
@@ -82,13 +117,21 @@ class OnePasswordClient:
             result.append({"id": vault.id, "name": vault.title})
         return result
     
-    async def list_items(self, vault_id: str) -> List[Dict[str, str]]:
+    async def list_items(self, vault_id_or_name: str) -> List[Dict[str, str]]:
         """List all items in a vault."""
         if not self.client:
             await self.connect()
         
+        # Find the vault first if a name is provided
+        if not vault_id_or_name.startswith("op") and not vault_id_or_name.isalnum():
+            vault_info = await self._find_vault(vault_id_or_name)
+            if not vault_info:
+                raise ValueError(f"Vault '{vault_id_or_name}' not found")
+            vault_id = vault_info["id"]
+        else:
+            vault_id = vault_id_or_name
+        
         result = []
-        # Pass the vault_id as a positional parameter
         items = await self.client.items.list_all(vault_id)
         async for item in items:
             result.append({"id": item.id, "title": item.title})
